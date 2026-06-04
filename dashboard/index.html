@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Museum Lijnvolger V2 — Dashboard</title>
+
+  <!-- MQTT.js via CDN (WebSocket-verbinding naar de broker) -->
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+
+  <style>
+    /* ── Reset & basis ── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0f1117;
+      --surface:   #1a1d27;
+      --border:    #2a2d3e;
+      --accent:    #4f8ef7;
+      --green:     #22c55e;
+      --red:       #ef4444;
+      --yellow:    #eab308;
+      --orange:    #f97316;
+      --text:      #e2e8f0;
+      --muted:     #64748b;
+      --radius:    10px;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-size: 14px;
+      min-height: 100vh;
+      padding: 24px;
+    }
+
+    /* ── Header ── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 24px;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    header h1 {
+      font-size: 1.4rem;
+      font-weight: 700;
+      letter-spacing: .5px;
+    }
+    header h1 span { color: var(--accent); }
+
+    #conn-badge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      border-radius: 99px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      font-size: .8rem;
+      font-weight: 600;
+    }
+    #conn-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: var(--muted);
+      transition: background .3s;
+    }
+    #conn-dot.connected    { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    #conn-dot.disconnected { background: var(--red);   box-shadow: 0 0 6px var(--red);   }
+
+    /* ── Layout grid ── */
+    .grid {
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      gap: 20px;
+    }
+    @media (max-width: 860px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+
+    /* ── Card ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+    }
+    .card-title {
+      font-size: .7rem;
+      font-weight: 700;
+      letter-spacing: 1.2px;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 16px;
+    }
+
+    /* ── Status badge ── */
+    #status-box {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 64px;
+      border-radius: var(--radius);
+      background: var(--bg);
+      border: 1px solid var(--border);
+      font-size: 1.3rem;
+      font-weight: 800;
+      letter-spacing: 2px;
+      color: var(--accent);
+      margin-bottom: 20px;
+      transition: color .2s;
+    }
+
+    /* ── IR sensoren ── */
+    .ir-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .ir-sensor {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+    }
+    .ir-label {
+      font-size: .7rem;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .ir-led {
+      width: 48px; height: 48px;
+      border-radius: 50%;
+      background: var(--bg);
+      border: 2px solid var(--border);
+      transition: background .15s, box-shadow .15s;
+    }
+    .ir-led.on {
+      background: var(--green);
+      border-color: var(--green);
+      box-shadow: 0 0 12px var(--green);
+    }
+    .ir-value {
+      font-size: .75rem;
+      color: var(--muted);
+    }
+
+    /* ── Afstandssensor ── */
+    .dist-row {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .dist-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+    }
+    .dist-label {
+      font-size: .7rem;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    #dist-value {
+      font-size: 1.4rem;
+      font-weight: 800;
+      color: var(--accent);
+      font-variant-numeric: tabular-nums;
+    }
+    #dist-unit { font-size: .75rem; color: var(--muted); margin-left: 2px; }
+
+    .dist-bar-bg {
+      width: 100%;
+      height: 10px;
+      background: var(--bg);
+      border-radius: 99px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+    }
+    #dist-bar {
+      height: 100%;
+      width: 0%;
+      border-radius: 99px;
+      background: var(--green);
+      transition: width .2s, background .2s;
+    }
+    .dist-scale {
+      display: flex;
+      justify-content: space-between;
+      font-size: .65rem;
+      color: var(--muted);
+    }
+
+    /* ── Log tabel ── */
+    .log-wrap {
+      height: 480px;
+      overflow-y: auto;
+      border-radius: calc(var(--radius) - 4px);
+      border: 1px solid var(--border);
+    }
+    .log-wrap::-webkit-scrollbar { width: 6px; }
+    .log-wrap::-webkit-scrollbar-track { background: transparent; }
+    .log-wrap::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    thead th {
+      position: sticky;
+      top: 0;
+      background: #12151f;
+      padding: 8px 12px;
+      text-align: left;
+      font-size: .68rem;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    tbody tr {
+      border-bottom: 1px solid var(--border);
+      transition: background .1s;
+    }
+    tbody tr:hover { background: rgba(255,255,255,.03); }
+    tbody tr.new-row { animation: flashRow .6s ease; }
+    @keyframes flashRow {
+      from { background: rgba(79,142,247,.15); }
+      to   { background: transparent; }
+    }
+
+    tbody td {
+      padding: 7px 12px;
+      font-size: .8rem;
+      white-space: nowrap;
+    }
+    td.ts    { color: var(--muted); font-variant-numeric: tabular-nums; }
+    td.dist  { font-variant-numeric: tabular-nums; }
+
+    /* status kleuren */
+    .s-RECHTDOOR  { color: var(--green); }
+    .s-BOCHT_L,
+    .s-BOCHT_R    { color: var(--accent); }
+    .s-PIVOT_L,
+    .s-PIVOT_R    { color: var(--yellow); }
+    .s-ZOEKEN     { color: var(--orange); }
+    .s-OBSTAKEL   { color: var(--red); font-weight: 700; }
+    .s-ONTWIJKEN  { color: var(--red); }
+    .s-LIJN_ZOEKEN,
+    .s-LIJN_HERVAT{ color: var(--yellow); }
+    .s-DWARSLIJN  { color: var(--muted); }
+    .s-START      { color: var(--muted); }
+
+    /* IR cellen */
+    .ir-cel { text-align: center; }
+    .dot-on  { color: var(--green); font-size: 1rem; }
+    .dot-off { color: var(--border); font-size: 1rem; }
+
+    /* dist kleur */
+    .dist-ok     { color: var(--green); }
+    .dist-warn   { color: var(--yellow); }
+    .dist-danger { color: var(--red); font-weight: 700; }
+
+    /* ── Log controls ── */
+    .log-controls {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 10px;
+      gap: 12px;
+    }
+    #log-count {
+      font-size: .75rem;
+      color: var(--muted);
+    }
+    .btn {
+      padding: 5px 14px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font-size: .75rem;
+      cursor: pointer;
+      transition: background .15s;
+    }
+    .btn:hover { background: var(--border); }
+
+    /* ── Broker config ── */
+    .config-bar {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 20px;
+      align-items: flex-end;
+    }
+    .config-bar label {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: .7rem;
+      color: var(--muted);
+      font-weight: 600;
+      letter-spacing: .5px;
+    }
+    .config-bar input {
+      padding: 6px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font-size: .8rem;
+      width: 160px;
+    }
+    .config-bar input:focus { outline: 2px solid var(--accent); }
+    #btn-connect {
+      padding: 7px 18px;
+      border-radius: 6px;
+      border: none;
+      background: var(--accent);
+      color: #fff;
+      font-size: .8rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: opacity .15s;
+    }
+    #btn-connect:hover { opacity: .85; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Museum Lijnvolger <span>V2</span></h1>
+  <div id="conn-badge">
+    <div id="conn-dot" class="disconnected"></div>
+    <span id="conn-label">Niet verbonden</span>
+  </div>
+</header>
+
+<!-- Broker instellen -->
+<div class="config-bar">
+  <label>BROKER IP
+    <input id="cfg-host" type="text" value="192.168.1.154" placeholder="IP-adres" />
+  </label>
+  <label>WS-POORT
+    <input id="cfg-port" type="number" value="9001" placeholder="9001" style="width:90px" />
+  </label>
+  <label>TOPIC
+    <input id="cfg-topic" type="text" value="museum/wagon/01/telemetry" style="width:240px" />
+  </label>
+  <button id="btn-connect" onclick="mqttConnect()">Verbinden</button>
+</div>
+
+<div class="grid">
+
+  <!-- Linkerkolom: sensorpaneel -->
+  <div style="display:flex;flex-direction:column;gap:20px;">
+
+    <div class="card">
+      <div class="card-title">Huidige status</div>
+      <div id="status-box">—</div>
+
+      <div class="card-title">IR-sensoren</div>
+      <div class="ir-row">
+        <div class="ir-sensor">
+          <div class="ir-label">Links</div>
+          <div class="ir-led" id="led-l"></div>
+          <div class="ir-value" id="val-l">—</div>
+        </div>
+        <div class="ir-sensor">
+          <div class="ir-label">Midden</div>
+          <div class="ir-led" id="led-m"></div>
+          <div class="ir-value" id="val-m">—</div>
+        </div>
+        <div class="ir-sensor">
+          <div class="ir-label">Rechts</div>
+          <div class="ir-led" id="led-r"></div>
+          <div class="ir-value" id="val-r">—</div>
+        </div>
+      </div>
+
+      <div class="dist-row">
+        <div class="dist-header">
+          <span class="dist-label">Afstandssensor (HC-SR04)</span>
+          <span><span id="dist-value">—</span><span id="dist-unit"> cm</span></span>
+        </div>
+        <div class="dist-bar-bg">
+          <div id="dist-bar"></div>
+        </div>
+        <div class="dist-scale"><span>0 cm</span><span>50 cm</span><span>100 cm</span></div>
+      </div>
+    </div>
+
+    <!-- Mini statistieken -->
+    <div class="card">
+      <div class="card-title">Statistieken sessie</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+        <div>
+          <div style="font-size:.7rem;color:var(--muted);margin-bottom:4px;">BERICHTEN</div>
+          <div id="stat-msgs" style="font-size:1.4rem;font-weight:800;color:var(--accent);">0</div>
+        </div>
+        <div>
+          <div style="font-size:.7rem;color:var(--muted);margin-bottom:4px;">ONTWIJKINGEN</div>
+          <div id="stat-avoid" style="font-size:1.4rem;font-weight:800;color:var(--red);">0</div>
+        </div>
+        <div>
+          <div style="font-size:.7rem;color:var(--muted);margin-bottom:4px;">MIN. AFSTAND</div>
+          <div id="stat-mindist" style="font-size:1.4rem;font-weight:800;color:var(--yellow);">—</div>
+        </div>
+        <div>
+          <div style="font-size:.7rem;color:var(--muted);margin-bottom:4px;">LAATSTE UPDATE</div>
+          <div id="stat-last" style="font-size:.85rem;font-weight:600;color:var(--text);">—</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Rechterkolom: bewegingslog -->
+  <div class="card">
+    <div class="card-title">Bewegingslog</div>
+    <div class="log-controls">
+      <span id="log-count">0 regels</span>
+      <div style="display:flex;gap:8px;">
+        <button class="btn" onclick="toggleScroll()">Auto-scroll: <span id="scroll-lbl">AAN</span></button>
+        <button class="btn" onclick="clearLog()">Log wissen</button>
+      </div>
+    </div>
+    <div class="log-wrap" id="log-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Tijd</th>
+            <th>Status / Beweging</th>
+            <th style="text-align:center">IR-L</th>
+            <th style="text-align:center">IR-M</th>
+            <th style="text-align:center">IR-R</th>
+            <th>Afstand</th>
+          </tr>
+        </thead>
+        <tbody id="log-body">
+          <tr>
+            <td colspan="6" style="text-align:center;color:var(--muted);padding:32px;">
+              Wachten op MQTT-berichten…
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div><!-- /grid -->
+
+<script>
+// ── Staat ──────────────────────────────────────────────────────
+let client       = null;
+let autoScroll   = true;
+let msgCount     = 0;
+let avoidCount   = 0;
+let minDist      = Infinity;
+let lastStatus   = '';
+let logRows      = 0;
+const MAX_ROWS   = 500; // max log-regels bijhouden in de DOM
+
+// ── MQTT verbinden ─────────────────────────────────────────────
+function mqttConnect() {
+  const host  = document.getElementById('cfg-host').value.trim();
+  const port  = parseInt(document.getElementById('cfg-port').value) || 9001;
+  const topic = document.getElementById('cfg-topic').value.trim();
+  const url   = `ws://${host}:${port}/mqtt`;
+
+  if (client) {
+    try { client.end(true); } catch(e) {}
+    client = null;
+  }
+
+  setConnStatus('connecting');
+  client = mqtt.connect(url, {
+    clientId:  'dashboard_' + Math.random().toString(16).slice(2, 8),
+    keepalive: 30,
+    reconnectPeriod: 3000,
+  });
+
+  client.on('connect', () => {
+    setConnStatus('connected');
+    client.subscribe(topic, { qos: 0 });
+  });
+
+  client.on('offline',  () => setConnStatus('disconnected'));
+  client.on('error',    () => setConnStatus('disconnected'));
+  client.on('close',    () => setConnStatus('disconnected'));
+
+  client.on('message', (_topic, payload) => {
+    try {
+      const data = JSON.parse(payload.toString());
+      handleMessage(data);
+    } catch(e) { /* ongeldige JSON, negeren */ }
+  });
+}
+
+// ── Status-indicator ──────────────────────────────────────────
+function setConnStatus(state) {
+  const dot   = document.getElementById('conn-dot');
+  const label = document.getElementById('conn-label');
+  dot.className = state === 'connected' ? 'connected' : 'disconnected';
+  label.textContent = {
+    connected:    'Verbonden',
+    disconnected: 'Niet verbonden',
+    connecting:   'Verbinden…',
+  }[state] || state;
+}
+
+// ── Binnenkomend bericht verwerken ────────────────────────────
+function handleMessage(data) {
+  const status = (data.status  ?? '—').toString();
+  const dist   = data.afstand;          // getal of null
+  const irL    = !!data.ir_l;
+  const irM    = !!data.ir_m;
+  const irR    = !!data.ir_r;
+  const now    = new Date();
+
+  msgCount++;
+  document.getElementById('stat-msgs').textContent = msgCount;
+
+  // Ontwijkingen tellen
+  if (status === 'OBSTAKEL') { avoidCount++; document.getElementById('stat-avoid').textContent = avoidCount; }
+
+  // Min afstand bijhouden
+  if (typeof dist === 'number' && dist > 0) {
+    if (dist < minDist) {
+      minDist = dist;
+      document.getElementById('stat-mindist').textContent = dist + ' cm';
+    }
+  }
+
+  // Laatste update
+  document.getElementById('stat-last').textContent = now.toLocaleTimeString('nl-BE');
+
+  // ── Sensorpaneel bijwerken ──
+  updateIR('l', irL);
+  updateIR('m', irM);
+  updateIR('r', irR);
+  updateDist(dist);
+  updateStatus(status);
+
+  // ── Log-rij toevoegen (alleen als status veranderd of afstand significant) ──
+  // Elke unieke statusverandering + elke 5e bericht voor continue sensorupdate
+  const isNewStatus = status !== lastStatus;
+  if (isNewStatus || msgCount % 5 === 0) {
+    addLogRow(now, status, irL, irM, irR, dist, isNewStatus);
+    lastStatus = status;
+  }
+}
+
+// ── IR-LED bijwerken ──────────────────────────────────────────
+function updateIR(side, active) {
+  const led = document.getElementById('led-' + side);
+  const val = document.getElementById('val-' + side);
+  led.className = 'ir-led' + (active ? ' on' : '');
+  val.textContent = active ? 'LIJN' : 'VRIJ';
+  val.style.color = active ? 'var(--green)' : 'var(--muted)';
+}
+
+// ── Afstandsbalk bijwerken ─────────────────────────────────────
+function updateDist(cm) {
+  const val  = document.getElementById('dist-value');
+  const bar  = document.getElementById('dist-bar');
+  if (typeof cm !== 'number' || cm < 0) {
+    val.textContent = '—';
+    val.style.color = 'var(--muted)';
+    bar.style.width = '0%';
+    bar.style.background = 'var(--muted)';
+    return;
+  }
+  val.textContent = cm;
+  // Schaal 0-100 cm
+  const pct = Math.min(100, Math.max(0, cm));
+  bar.style.width = pct + '%';
+  // Kleur: rood < 20 cm, geel 20-40, groen > 40
+  if (cm < 20) {
+    bar.style.background = 'var(--red)';
+    val.style.color = 'var(--red)';
+  } else if (cm < 40) {
+    bar.style.background = 'var(--yellow)';
+    val.style.color = 'var(--yellow)';
+  } else {
+    bar.style.background = 'var(--green)';
+    val.style.color = 'var(--green)';
+  }
+}
+
+// ── Status-box bijwerken ──────────────────────────────────────
+const STATUS_COLORS = {
+  RECHTDOOR:   'var(--green)',
+  BOCHT_L:     'var(--accent)',
+  BOCHT_R:     'var(--accent)',
+  PIVOT_L:     'var(--yellow)',
+  PIVOT_R:     'var(--yellow)',
+  ZOEKEN:      'var(--orange)',
+  OBSTAKEL:    'var(--red)',
+  ONTWIJKEN:   'var(--red)',
+  LIJN_ZOEKEN: 'var(--yellow)',
+  LIJN_HERVAT: 'var(--green)',
+  DWARSLIJN:   'var(--muted)',
+  START:       'var(--muted)',
+};
+function updateStatus(status) {
+  const box = document.getElementById('status-box');
+  box.textContent = status;
+  box.style.color = STATUS_COLORS[status] ?? 'var(--accent)';
+}
+
+// ── Log-rij toevoegen ─────────────────────────────────────────
+function addLogRow(date, status, irL, irM, irR, dist, highlight) {
+  const tbody = document.getElementById('log-body');
+
+  // Eerste echte rij verwijdert de placeholder
+  if (logRows === 0) tbody.innerHTML = '';
+
+  // Oude rijen verwijderen als de limiet bereikt is
+  while (tbody.rows.length >= MAX_ROWS) tbody.deleteRow(0);
+
+  const tr = document.createElement('tr');
+  if (highlight) tr.classList.add('new-row');
+
+  const ts = date.toLocaleTimeString('nl-BE', { hour12: false }) +
+             '.' + String(date.getMilliseconds()).padStart(3, '0');
+
+  // Afstand kleur
+  let distClass = 'dist-ok', distTxt = '—';
+  if (typeof dist === 'number' && dist >= 0) {
+    distTxt = dist + ' cm';
+    distClass = dist < 20 ? 'dist-danger' : dist < 40 ? 'dist-warn' : 'dist-ok';
+  }
+
+  tr.innerHTML = `
+    <td class="ts">${ts}</td>
+    <td class="s-${status}">${status}</td>
+    <td class="ir-cel">${dot(irL)}</td>
+    <td class="ir-cel">${dot(irM)}</td>
+    <td class="ir-cel">${dot(irR)}</td>
+    <td class="dist ${distClass}">${distTxt}</td>
+  `;
+
+  tbody.appendChild(tr);
+  logRows++;
+  document.getElementById('log-count').textContent = logRows + ' regels';
+
+  if (autoScroll) {
+    const wrap = document.getElementById('log-wrap');
+    wrap.scrollTop = wrap.scrollHeight;
+  }
+}
+
+function dot(active) {
+  return active
+    ? '<span class="dot-on">●</span>'
+    : '<span class="dot-off">○</span>';
+}
+
+// ── Controls ─────────────────────────────────────────────────
+function toggleScroll() {
+  autoScroll = !autoScroll;
+  document.getElementById('scroll-lbl').textContent = autoScroll ? 'AAN' : 'UIT';
+}
+
+function clearLog() {
+  document.getElementById('log-body').innerHTML = `
+    <tr><td colspan="6" style="text-align:center;color:var(--muted);padding:32px;">
+      Log gewist — wachten op nieuwe berichten…
+    </td></tr>`;
+  logRows = 0;
+  msgCount = 0; avoidCount = 0; minDist = Infinity;
+  document.getElementById('stat-msgs').textContent  = '0';
+  document.getElementById('stat-avoid').textContent = '0';
+  document.getElementById('stat-mindist').textContent = '—';
+  document.getElementById('log-count').textContent  = '0 regels';
+}
+
+// Auto-verbinden bij laden
+window.addEventListener('load', mqttConnect);
+</script>
+</body>
+</html>
