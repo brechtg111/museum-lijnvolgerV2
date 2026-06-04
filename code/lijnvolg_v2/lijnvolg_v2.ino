@@ -74,10 +74,10 @@ bool   sL = false, sM = false, sR = false; // gefilterde IR-sensorwaarden
 // pivotSpeed = draaisnelheid bij een pivot-turn (0-255).
 //   Verlagen als de robot de lijn overshooit bij zoeken.
 // =============================================================
-#define Q 2
-int baseSpeed  = 180;
-int correction = 150;
-int pivotSpeed = 250;
+#define Q 4
+int baseSpeed  = 190;
+int correction = 160;
+int pivotSpeed = 235;
 
 // =============================================================
 // OBSTAKEL-PARAMETERS
@@ -105,20 +105,20 @@ int pivotSpeed = 250;
 // =============================================================
 #define SERVO_VOORUIT        90   // servo-hoek voor vooruit kijken
 #define SERVO_OBJECT        170   // servo-hoek om naar het obstakel te kijken (zijwaarts)
-#define OBSTAKEL_AFSTAND     15   // cm - obstakeldetectie drempel
-#define OBJECT_ZIJ_MAX       30   // cm - max afstand om object nog als "aanwezig" te beschouwen
-#define MAX_AFSTAND         200   // cm - meetwaarden boven dit worden genegeerd (-1)
+#define OBSTAKEL_AFSTAND     25   // cm - obstakeldetectie drempel
+#define OBJECT_ZIJ_MAX       25   // cm - max afstand om object nog als "aanwezig" te beschouwen
+#define MAX_AFSTAND         100   // cm - meetwaarden boven dit worden genegeerd (-1)
 #define RIJD_SNELHEID       195   // PWM rijsnelheid tijdens ontwijking
-#define DRAAI_SNELHEID      210   // PWM draaisnelheid
+#define DRAAI_SNELHEID      200   // PWM draaisnelheid
 #define DRAAI_90_MS         600   // ms voor ~90° draai
-#define SIDESTEP_MS         400   // ms rechtdoor na eerste draai
-#define EXTRA_MS            200   // ms extra vooruit na voorbijrijden
+#define SIDESTEP_MS         550   // ms rechtdoor na eerste draai
+#define EXTRA_MS            300   // ms extra vooruit na voorbijrijden
 #define PAS_TIMEOUT_MS     4000   // ms maximale voorbijrij-tijd
 #define ULTRA_INTERVAL      100   // ms tussen ultrasone metingen
-#define BOCHT_BINNEN        150   // PWM binnenwiel terugbocht
-#define BOCHT_BUITEN        200   // PWM buitenwiel terugbocht
+#define BOCHT_BINNEN        100   // PWM binnenwiel terugbocht
+#define BOCHT_BUITEN        180   // PWM buitenwiel terugbocht
 #define LIJN_ZOEK_MS       2500   // ms maximale zoektijd voor de lijn
-#define OBSTAKEL_COOLDOWN_MS 3000 // ms geen nieuwe obstakeldetectie na ontwijking
+#define OBSTAKEL_COOLDOWN_MS 10000 // ms geen nieuwe obstakeldetectie na ontwijking
 
 Servo scanServo;
 
@@ -134,8 +134,18 @@ int lastLeft     = 0, lastRight     = 0;
 // Wordt gebruikt om bij lijn-kwijt de juiste zoekrichting te kiezen
 int lastDir = 1;
 
-unsigned long lastUltra       = 0; // tijdstip laatste ultrasone meting
+unsigned long lastUltra        = 0; // tijdstip laatste ultrasone meting
 unsigned long obstakelNegeerTot = 0; // tot wanneer obstakels genegeerd worden na ontwijking
+
+// Zoektimer: wordt gestart zodra alle IR-sensoren leeg zijn.
+// Wordt gereset naar 0 zodra de lijn opnieuw gevonden wordt.
+// Gebruik: gefaseerd zoeken met tijdslimiet zodat de robot niet eindeloos draait.
+// ZOEK_FASE1_MS : tijd (ms) dat in de laatste bekende richting gezocht wordt
+// ZOEK_FASE2_MS : extra tijd (ms) dat in de omgekeerde richting gezocht wordt
+// Na ZOEK_FASE1_MS + ZOEK_FASE2_MS stopt de robot volledig (lijn niet gevonden).
+#define ZOEK_FASE1_MS 1500  // ms draaien in lastDir    → verhogen voor meer geduld
+#define ZOEK_FASE2_MS 1500  // ms draaien in -lastDir   → verhogen voor meer geduld
+unsigned long zoekStart = 0;
 
 // Staten om bij te houden wat de robot de vorige loop-iteratie deed
 // Wordt gebruikt om vloeiend van rechtdoor naar een bocht te schakelen
@@ -542,22 +552,43 @@ void loop() {
 
   if (!L && !M && !R) {
     // Geen sensor ziet de lijn: robot is de lijn kwijt.
-    // Draai ter plaatse in de laatste bekende richting om de lijn te zoeken.
+    // Gefaseerd zoeken met tijdslimiet om eindeloos ronddraaien te voorkomen:
+    //   Fase 1 (0 – ZOEK_FASE1_MS)       : pivot in lastDir (meest waarschijnlijke kant)
+    //   Fase 2 (ZOEK_FASE1_MS – FASE1+2) : pivot in omgekeerde richting
+    //   Fase 3 (> FASE1+FASE2)           : volledig stoppen — robot geeft het op
+    if (zoekStart == 0) zoekStart = millis(); // start de zoektimer bij eerste kwijt-iteratie
+    unsigned long zoekDuur = millis() - zoekStart;
+
     currentLeft = 0; currentRight = 0;
-    if (lastDir == -1) setMotors(pivotSpeed, -pivotSpeed); // pivot links
-    else               setMotors(-pivotSpeed, pivotSpeed); // pivot rechts
-    prevState  = NONE;
-    statusTekst = "ZOEKEN";
+
+    if (zoekDuur < ZOEK_FASE1_MS) {
+      // Fase 1: draai in de richting waar de lijn het laatst gezien werd
+      if (lastDir == -1) setMotors(pivotSpeed, -pivotSpeed);
+      else               setMotors(-pivotSpeed, pivotSpeed);
+      statusTekst = "ZOEKEN_1";
+    } else if (zoekDuur < ZOEK_FASE1_MS + ZOEK_FASE2_MS) {
+      // Fase 2: draai de andere kant op (lijn eventueel aan de andere zijde)
+      if (lastDir == -1) setMotors(-pivotSpeed, pivotSpeed);
+      else               setMotors(pivotSpeed, -pivotSpeed);
+      statusTekst = "ZOEKEN_2";
+    } else {
+      // Fase 3: beide fasen mislukt — stop volledig om schade te vermijden
+      stopMotors();
+      statusTekst = "LIJN_KWIJT";
+    }
+    prevState = NONE;
   }
   else if (!L && M && !R) {
     // Alleen midden: robot rijdt recht over de lijn.
     // stepMotorsFade zorgt voor geleidelijk optrekken (minder wiel-slip).
+    zoekStart = 0; // lijn gevonden, zoektimer resetten
     stepMotorsFade(baseSpeed, baseSpeed);
     prevState  = STRAIGHT;
     statusTekst = "RECHTDOOR";
   }
   else if (L && !M && !R) {
     // Alleen links: lijn is ver naar links, harde pivot links.
+    zoekStart = 0;
     lastDir = -1;
     currentLeft = 0; currentRight = 0;
     setMotors(pivotSpeed, -pivotSpeed);
@@ -566,6 +597,7 @@ void loop() {
   }
   else if (!L && !M && R) {
     // Alleen rechts: lijn is ver naar rechts, harde pivot rechts.
+    zoekStart = 0;
     lastDir = 1;
     currentLeft = 0; currentRight = 0;
     setMotors(-pivotSpeed, pivotSpeed);
@@ -576,6 +608,7 @@ void loop() {
     // Links + midden: lijn buigt naar links.
     // Vanuit rechtdoor: zacht ingaan (halve snelheid, binnenste wiel stopt).
     // Vanuit een eerdere bocht: agressievere correctie.
+    zoekStart = 0;
     lastDir = -1;
     currentLeft = 0; currentRight = 0;
     if (prevState == STRAIGHT) setMotors(baseSpeed / 2, 0);
@@ -585,6 +618,7 @@ void loop() {
   }
   else if (!L && M && R) {
     // Midden + rechts: lijn buigt naar rechts. Spiegeling van bovenstaand.
+    zoekStart = 0;
     lastDir = 1;
     currentLeft = 0; currentRight = 0;
     if (prevState == STRAIGHT) setMotors(0, baseSpeed / 2);
@@ -595,11 +629,12 @@ void loop() {
   else {
     // Alle drie sensoren actief tegelijk = dwarslijn of kruispunt.
     // Robot stopt volledig. Aanpassen als je kruispunten anders wil behandelen.
+    zoekStart = 0;
     stopMotors();
     prevState  = NONE;
     statusTekst = "DWARSLIJN";
   }
 
-  delay(20); // 20 ms per loop = ~50 Hz lijnvolg-frequentie
+  delay(10); // 20 ms per loop = ~50 Hz lijnvolg-frequentie
              // Verlagen = snellere reactie maar meer CPU-belasting
 }
