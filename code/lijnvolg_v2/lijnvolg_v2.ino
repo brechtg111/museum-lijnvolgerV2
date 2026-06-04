@@ -420,151 +420,136 @@ void servoNaar(int doel) {
 // =============================================================
 // ontwijkRechts
 // Volledige ontwijkingsroutine wanneer een obstakel gedetecteerd wordt.
+//
 // Stappen:
 //   1. Stop + 1 s wachten (veiligheidsrust)
-//   2. Rechts draaien, zijwaarts rijden, links draaien
-//      → robot staat nu naast het obstakel
-//   3. Servo naar het obstakel draaien en vooruitrijden
-//      tot het obstakel 3x achter elkaar buiten OBJECT_ZIJ_MAX cm valt
-//   4. Extra stukje vooruit (EXTRA_MS) voor voldoende speling
-//   5. Servo terug vooruit, zachte bocht naar links
-//      → stopt zodra een IR-sensor de lijn detecteert
-//
-// Telemetrie-statussen per stap (zichtbaar in dashboard):
-//   Stap 0 : OBSTAKEL          → obstakel gedetecteerd, afstand meegegeven
-//   Stap 1 : DRAAI_RECHTS      → start 90° rechtse draai
-//            ZIJSTAP           → rijdt zijwaarts naast het object
-//            DRAAI_LINKS       → start 90° linkse draai terug
-//   Stap 2 : SCAN_OBJECT       → servo draait naar object, meting start
-//            NAAST_OBJECT      → rijdt naast het object (kwijt_teller zichtbaar)
-//            OBJECT_VOORBIJ    → object 3x buiten bereik → gestopt
-//            OBJECT_TIMEOUT    → PAS_TIMEOUT_MS bereikt zonder object te verliezen
-//   Stap 3 : EXTRA_VOORUIT     → extra stukje vooruit voor speling
-//   Stap 4 : LIJN_ZOEKEN       → zachte bocht naar links, lijn zoeken
-//   Stap 5 : LIJN_HERVAT       → lijn gevonden (lijn_sensor = welke IR-sensor)
-//            LIJN_NIET_GEVONDEN → LIJN_ZOEK_MS verstreken zonder lijndetectie
+//   2. Rechts draaien (DRAAI_90_MS) → SIDESTEP_MS vooruit → links draaien (DRAAI_90_MS)
+//      → robot staat naast het obstakel, parallel aan de lijn
+//   3. Servo naar het obstakel, vooruitrijden tot obstakel 3x buiten OBJECT_ZIJ_MAX cm valt
+//      → robot is voorbij het obstakel
+//   4. Servo terug vooruit → 90° links draaien (DRAAI_90_MS) → SIDESTEP_MS vooruit
+//      → robot rijdt exact dezelfde zijstap terug, richting originele lijnpositie
+//   5. Sensorcheck: rapporteer welke IR-sensor de lijn ziet en hervat het lijnvolgen
 //
 // AANPASSEN ALS:
-//   - robot draait te ver/weinig: pas DRAAI_90_MS aan
-//   - robot rijdt te ver/weinig naast object: pas SIDESTEP_MS aan
-//   - robot vindt de lijn niet terug: pas BOCHT_BINNEN/BOCHT_BUITEN of LIJN_ZOEK_MS aan
+//   - robot draait te ver/weinig bij terugkeer: pas DRAAI_90_MS aan
+//   - robot komt te ver/dichtbij de lijn uit: pas SIDESTEP_MS aan
+//   - robot staat scheef na de ontwijking: batterijspanning beïnvloedt draaitijd
 // =============================================================
 void ontwijkRechts() {
-  unsigned long ontwijkStart = millis(); // starttijdstip voor duur_ms in alle berichten
+  unsigned long ontwijkStart = millis();
 
-  // --- Obstakel gedetecteerd: stop en wacht ---
+  // --- Obstakel gedetecteerd ---
   statusTekst = "OBSTAKEL";
-  afstandCm = meetAfstand(); // laatste meting meesturen in het bericht
-  publishOntwijkTelemetry(0, 0);
+  afstandCm = meetAfstand();
+  publishTelemetry();
   Serial.printf("OBSTAKEL gezien op %d cm - stop 1 seconde\n", afstandCm);
   stopMotors(); delay(1000);
 
   // -------------------------------------------------------
-  // STAP 1: zijwaarts rechts naast het object plaatsen
-  //         (draai 90° rechts → rijdt SIDESTEP_MS rechtdoor → draai 90° links)
+  // STAP 1: zijwaarts rechts naast het obstakel plaatsen
+  //   draai 90° rechts → rijdt SIDESTEP_MS zijwaarts → draai 90° links terug
+  //   Robot staat nu parallel aan de lijn, naast het obstakel
   // -------------------------------------------------------
-  statusTekst = "DRAAI_RECHTS";
-  publishOntwijkTelemetry(1, millis() - ontwijkStart);
-  Serial.println("Stap 1a: draai rechts");
+  statusTekst = "DRAAI_RECHTS"; publishTelemetry();
+  Serial.println("Stap 1a: draai 90° rechts");
   draaiRechts(DRAAI_90_MS);
 
-  statusTekst = "ZIJSTAP";
-  publishOntwijkTelemetry(1, millis() - ontwijkStart);
-  Serial.println("Stap 1b: zijstap vooruit");
+  statusTekst = "ZIJSTAP"; publishTelemetry();
+  Serial.printf("Stap 1b: zijstap vooruit (%d ms)\n", SIDESTEP_MS);
   vooruitTijd(SIDESTEP_MS);
 
-  statusTekst = "DRAAI_LINKS";
-  publishOntwijkTelemetry(1, millis() - ontwijkStart);
-  Serial.println("Stap 1c: draai links - robot staat naast het object");
+  statusTekst = "DRAAI_LINKS"; publishTelemetry();
+  Serial.println("Stap 1c: draai 90° links - staat naast het obstakel");
   draaiLinks(DRAAI_90_MS);
 
   // -------------------------------------------------------
-  // STAP 2: servo richting object, rijden tot object voorbij is
+  // STAP 2: servo richting obstakel, rijden tot obstakel voorbij is
+  //   Stopt zodra het obstakel 3x achter elkaar buiten OBJECT_ZIJ_MAX cm valt,
+  //   of als PAS_TIMEOUT_MS bereikt wordt (veiligheidsgrens)
   // -------------------------------------------------------
-  statusTekst = "SCAN_OBJECT";
-  publishOntwijkTelemetry(2, millis() - ontwijkStart);
-  Serial.println("Stap 2: servo naar object, vooruitrijden");
+  statusTekst = "SCAN_OBJECT"; publishTelemetry();
+  Serial.println("Stap 2: servo naar obstakel, vooruitrijden");
   servoNaar(SERVO_OBJECT);
   delay(300); // wacht tot servo stil staat voor eerste meting
 
   vooruit(RIJD_SNELHEID);
   unsigned long start = millis();
-  int kwijt = 0; // teller: opeenvolgende metingen buiten OBJECT_ZIJ_MAX
+  int kwijt = 0;
   bool timeout = false;
 
   while (true) {
     int d = meetAfstand();
     afstandCm = d;
-    sL = digitalRead(IR_L); sM = digitalRead(IR_M); sR = digitalRead(IR_R);
     statusTekst = "NAAST_OBJECT";
-    mqttOnderhoud();
-    publishOntwijkTelemetry(2, millis() - ontwijkStart, kwijt); // kwijt-teller zichtbaar in dashboard
-    Serial.printf("  naast object: %d cm | kwijt=%d\n", d, kwijt);
+    mqttOnderhoud(); publishTelemetry();
+    Serial.printf("  naast obstakel: %d cm | kwijt=%d\n", d, kwijt);
 
     if (d == -1 || d > OBJECT_ZIJ_MAX) {
-      if (++kwijt >= 3) break; // 3x achter elkaar buiten bereik = object voorbij
+      if (++kwijt >= 3) break; // 3x buiten bereik = obstakel voorbij
     } else {
-      kwijt = 0; // object terug in beeld, teller resetten
+      kwijt = 0;               // obstakel terug in beeld, teller resetten
     }
-    if (millis() - start > PAS_TIMEOUT_MS) { timeout = true; break; } // veiligheidsgrens
+    if (millis() - start > PAS_TIMEOUT_MS) { timeout = true; break; }
     delay(60);
   }
   stopMotors();
 
-  // Meld of het object voorbij is of de timeout bereikt werd
   statusTekst = timeout ? "OBJECT_TIMEOUT" : "OBJECT_VOORBIJ";
-  publishOntwijkTelemetry(2, millis() - ontwijkStart, kwijt);
+  publishTelemetry();
   Serial.printf("Stap 2 klaar: %s na %lu ms\n", statusTekst.c_str(), millis() - start);
 
   // -------------------------------------------------------
   // STAP 3: extra stukje vooruit voor voldoende speling
+  //   Zorgt dat de robot volledig naast het obstakel staat
+  //   voor de terugdraai in stap 4 begint
   // -------------------------------------------------------
-  statusTekst = "EXTRA_VOORUIT";
-  publishOntwijkTelemetry(3, millis() - ontwijkStart);
-  Serial.println("Stap 3: extra vooruit voor speling");
+  statusTekst = "EXTRA_VOORUIT"; publishTelemetry();
+  Serial.printf("Stap 3: extra vooruit (%d ms)\n", EXTRA_MS);
   vooruitTijd(EXTRA_MS);
 
   // -------------------------------------------------------
-  // STAP 4: servo terug vooruit, zachte bocht naar links
-  //         stopt zodra een IR-sensor de lijn detecteert
+  // STAP 4: deterministische terugkeer naar de lijn
+  //   Servo terug vooruit → 90° links draaien → SIDESTEP_MS vooruit
+  //   Zelfde afstand als de zijstap in stap 1 zodat de robot
+  //   terug op de originele lijnpositie terechtkomt
   // -------------------------------------------------------
   servoNaar(SERVO_VOORUIT);
-  statusTekst = "LIJN_ZOEKEN";
-  lastDir = -1; // na ontwijking rechts ligt de lijn links
-  publishOntwijkTelemetry(4, millis() - ontwijkStart);
-  Serial.println("Stap 4: zachte bocht links, lijn zoeken");
 
-  unsigned long tZoek = millis();
-  const char* lijnSensor = "geen"; // welke sensor de lijn vond
+  statusTekst = "TERUGDRAAIEN"; publishTelemetry();
+  Serial.println("Stap 4a: draai 90° links richting lijn");
+  draaiLinks(DRAAI_90_MS);
 
-  while (millis() - tZoek < LIJN_ZOEK_MS) {
-    bool irL = digitalRead(IR_L);
-    bool irM = digitalRead(IR_M);
-    bool irR = digitalRead(IR_R);
-    sL = irL; sM = irM; sR = irR;
+  statusTekst = "TERUG_VOORUIT"; publishTelemetry();
+  Serial.printf("Stap 4b: rijd %d ms vooruit naar lijn\n", SIDESTEP_MS);
+  vooruitTijd(SIDESTEP_MS);
 
-    if (irL || irM || irR) {
-      // Bepaal welke sensor(en) de lijn zien voor telemetrie
-      if      (irL && irM && irR) lijnSensor = "L+M+R";
-      else if (irL && irM)        lijnSensor = "L+M";
-      else if (irM && irR)        lijnSensor = "M+R";
-      else if (irL)               lijnSensor = "L";
-      else if (irM)               lijnSensor = "M";
-      else                        lijnSensor = "R";
-      break;
-    }
-    setMotors(BOCHT_BINNEN, BOCHT_BUITEN); // zachte bocht: buitenwiel sneller
-    delay(10);
+  // -------------------------------------------------------
+  // STAP 5: sensorcheck en telemetrie
+  //   Lees de IR-sensoren uit na aankomst en rapporteer
+  //   welke sensor de lijn ziet. Lijnvolgen wordt sowieso
+  //   hervat door de hoofdlus — de sensoren sturen verder.
+  // -------------------------------------------------------
+  lastDir = -1; // zoekrichting instellen als de lijn nog niet meteen gevonden is
+  sL = digitalRead(IR_L);
+  sM = digitalRead(IR_M);
+  sR = digitalRead(IR_R);
+
+  // Bepaal welke sensor(en) de lijn detecteren voor telemetrie
+  const char* lijnSensor = "geen";
+  if (sL || sM || sR) {
+    if      (sL && sM && sR) lijnSensor = "L+M+R";
+    else if (sL && sM)       lijnSensor = "L+M";
+    else if (sM && sR)       lijnSensor = "M+R";
+    else if (sL)             lijnSensor = "L";
+    else if (sM)             lijnSensor = "M";
+    else                     lijnSensor = "R";
   }
-  stopMotors();
 
-  // -------------------------------------------------------
-  // STAP 5: lijn gevonden of zoektijd verstreken
-  // -------------------------------------------------------
   bool lijnGevonden = (strcmp(lijnSensor, "geen") != 0);
   statusTekst = lijnGevonden ? "LIJN_HERVAT" : "LIJN_NIET_GEVONDEN";
-  publishOntwijkTelemetry(5, millis() - ontwijkStart, 0, lijnSensor);
-  Serial.printf("Stap 5: %s via sensor [%s] | totale ontwijkduur: %lu ms\n",
+  publishTelemetry();
+  Serial.printf("Stap 5: %s | sensor=[%s] | totale duur: %lu ms\n",
                 statusTekst.c_str(), lijnSensor, millis() - ontwijkStart);
 }
 
