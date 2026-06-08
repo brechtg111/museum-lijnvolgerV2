@@ -13,6 +13,8 @@
 #include <WiFi.h>
 #include <PubSubClient.h> // MQTT client
 #include <ArduinoJson.h>  // JSON opbouw voor telemetrie
+// GPIO 12 = ADC2 → werkt NIET met analogRead() als WiFi actief is.
+// Meting gebeurt daarom éénmalig vóór WiFi-start in setup().
 
 // =============================================================
 // WIFI / MQTT INSTELLINGEN
@@ -25,7 +27,11 @@ const char* mqtt_server     = "192.168.1.154";   // IP van de MQTT broker (Raspb
 const int   mqtt_port       = 1883;
 const char* mqtt_user       = "wagon01";
 const char* mqtt_pass       = "pi123";
-const char* TOPIC_TELEMETRY = "museum/wagon/01/telemetry"; // topic waarop de robot publiceert
+const char* TOPIC_TELEMETRY = "museum/wagon/01/telemetry";
+const char* TOPIC_ALERT     = "museum/wagon/01/event/error";
+const char* TOPIC_CMD_STOP  = "museum/wagon/01/cmd/stop";
+const char* TOPIC_CMD_START = "museum/wagon/01/cmd/start";
+const char* TOPIC_BROADCAST = "museum/system/broadcast/stop";
 
 WiFiClient   espClient;
 PubSubClient mqttClient(espClient);
@@ -44,7 +50,7 @@ bool   sL = false, sM = false, sR = false; // gefilterde IR-sensorwaarden
 // =============================================================
 #define IR_L 34   // linker IR-sensor (digitaal: HIGH = lijn gezien)
 #define IR_M 35   // midden IR-sensor
-#define IR_R 33   // rechter IR-sensor
+#define IR_R 32   // rechter IR-sensor
 
 // L298N motordriver - linkermotor via ENA/IN1/IN2, rechtermotor via ENB/IN3/IN4
 #define ENA 19    // PWM snelheidsregeling linkermotor (enable A)
@@ -56,7 +62,14 @@ bool   sL = false, sM = false, sR = false; // gefilterde IR-sensorwaarden
 
 #define TRIG_PIN  25  // ultrasone sensor: trigger (output)
 #define ECHO_PIN  27  // ultrasone sensor: echo (input)
-#define SERVO_PIN 14  // servo voor scan-richting
+#define SERVO_PIN 33  // servo voor scan-richting
+
+#define BTN_START  15  // startknop (INPUT_PULLUP → LOW = ingedrukt)
+#define BTN_STOP   26  // stopknop  (INPUT_PULLUP → LOW = ingedrukt)
+#define BAT_PIN    12  // batterijspanning via spanningsdeler (ADC1)
+#define LED_GREEN  21  // groene LED  > 30 %
+#define LED_YELLOW 22  // gele LED   10–30 %
+#define LED_RED    23  // rode LED    ≤ 10 %
 
 // PWM-kanalen voor de motoren (servo bezet timer 0 via ESP32Servo;
 // kanaal 4 en 6 vermijden conflict met servo-timers 0-3)
@@ -75,9 +88,18 @@ bool   sL = false, sM = false, sR = false; // gefilterde IR-sensorwaarden
 //   Verlagen als de robot de lijn overshooit bij zoeken.
 // =============================================================
 #define Q 4
-int baseSpeed  = 190;
-int correction = 160;
-int pivotSpeed = 235;
+int baseSpeed  = 200;
+int correction = 230;  // verhoogd: scherpere correctie in bochten
+int pivotSpeed = 255;  // max vermogen voor pivot-bochten
+
+// =============================================================
+// MOTOR TRIM (onbalans correctie)
+// Als de robot bij RECHTDOOR naar links trekt: verhoog TRIM_R of verlaag TRIM_L
+// Als de robot bij RECHTDOOR naar rechts trekt: verhoog TRIM_L of verlaag TRIM_R
+// Bereik: -50 tot +50  (begin met stapjes van 5)
+// =============================================================
+int TRIM_L =  0;   // extra PWM op linkermotor
+int TRIM_R =  0;   // extra PWM op rechtermotor
 
 // =============================================================
 // OBSTAKEL-PARAMETERS
@@ -137,6 +159,16 @@ int lastDir = 1;
 unsigned long lastUltra        = 0; // tijdstip laatste ultrasone meting
 unsigned long obstakelNegeerTot = 0; // tot wanneer obstakels genegeerd worden na ontwijking
 
+// Rijstatus via knoppen / MQTT
+bool running          = false;
+unsigned long stopTime            = 0;
+bool stopTimerActive              = false;
+const unsigned long STOP_DURATION = 30000; // ms automatisch herstart na stop-knop
+
+// Batterijwaarden voor telemetrie
+float batteryV   = 8.4;
+int   batteryPct = 100;
+
 // Zoektimer: wordt gestart zodra alle IR-sensoren leeg zijn.
 // Wordt gereset naar 0 zodra de lijn opnieuw gevonden wordt.
 // Gebruik: gefaseerd zoeken met tijdslimiet zodat de robot niet eindeloos draait.
@@ -145,7 +177,9 @@ unsigned long obstakelNegeerTot = 0; // tot wanneer obstakels genegeerd worden n
 // Na ZOEK_FASE1_MS + ZOEK_FASE2_MS stopt de robot volledig (lijn niet gevonden).
 #define ZOEK_FASE1_MS 1500  // ms draaien in lastDir    → verhogen voor meer geduld
 #define ZOEK_FASE2_MS 1500  // ms draaien in -lastDir   → verhogen voor meer geduld
-unsigned long zoekStart = 0;
+unsigned long zoekStart     = 0;
+unsigned long dwarslijnStart = 0; // tijdstip waarop alle 3 sensoren voor het eerst actief werden
+#define DWARSLIJN_MS 200          // ms dat alle sensoren actief moeten zijn voor een echt kruispunt
 
 // Staten om bij te houden wat de robot de vorige loop-iteratie deed
 // Wordt gebruikt om vloeiend van rechtdoor naar een bocht te schakelen
@@ -198,8 +232,8 @@ void setMotors(int leftSpeed, int rightSpeed) {
   if (rightSpeed >= 0) { digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); }
   else { digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); rightSpeed = -rightSpeed; }
 
-  ledcWrite(ENA, constrain(leftSpeed,  0, 255));
-  ledcWrite(ENB, constrain(rightSpeed, 0, 255));
+  ledcWrite(ENA, constrain(leftSpeed  + TRIM_L, 0, 255));
+  ledcWrite(ENB, constrain(rightSpeed + TRIM_R, 0, 255));
   lastLeft  = leftSpeed;
   lastRight = rightSpeed;
 }
@@ -225,8 +259,8 @@ void stepMotorsFade(int targetLeft, int targetRight, int step = 8) {
   if (currentRight < targetRight) currentRight = min(currentRight + step, targetRight);
   if (currentRight > targetRight) currentRight = max(currentRight - step, targetRight);
 
-  ledcWrite(ENA, constrain(currentLeft,  0, 255));
-  ledcWrite(ENB, constrain(currentRight, 0, 255));
+  ledcWrite(ENA, constrain(currentLeft  + TRIM_L, 0, 255));
+  ledcWrite(ENB, constrain(currentRight + TRIM_R, 0, 255));
   lastLeft  = currentLeft;
   lastRight = currentRight;
 }
@@ -269,7 +303,11 @@ void mqttOnderhoud() {
   static unsigned long lastTry = 0;
   if (millis() - lastTry < 2000) return; // wacht 2 s voor herverbinding
   lastTry = millis();
-  mqttClient.connect("ESP32-lijnauto", mqtt_user, mqtt_pass);
+  if (mqttClient.connect("ESP32-lijnauto", mqtt_user, mqtt_pass)) {
+    mqttClient.subscribe(TOPIC_CMD_STOP);
+    mqttClient.subscribe(TOPIC_CMD_START);
+    mqttClient.subscribe(TOPIC_BROADCAST);
+  }
 }
 
 
@@ -281,13 +319,24 @@ void mqttOnderhoud() {
 // =============================================================
 void publishTelemetry() {
   if (!mqttClient.connected()) return;
-  StaticJsonDocument<200> doc;
-  doc["status"]  = statusTekst;
-  doc["afstand"] = afstandCm;
-  doc["ir_l"] = sL; doc["ir_m"] = sM; doc["ir_r"] = sR;
-  char buf[200];
+  StaticJsonDocument<256> doc;
+  doc["status"]      = statusTekst;
+  doc["afstand"]     = afstandCm;
+  doc["ir_l"]        = sL; doc["ir_m"] = sM; doc["ir_r"] = sR;
+  doc["battery_v"]   = batteryV;
+  doc["battery_pct"] = batteryPct;
+  char buf[256];
   serializeJson(doc, buf);
   mqttClient.publish(TOPIC_TELEMETRY, buf);
+
+  if (batteryPct <= 10) {
+    StaticJsonDocument<64> alert;
+    alert["type"]    = "low_battery";
+    alert["battery"] = batteryPct;
+    char alertBuf[64];
+    serializeJson(alert, alertBuf);
+    mqttClient.publish(TOPIC_ALERT, alertBuf);
+  }
 }
 
 
@@ -555,6 +604,66 @@ void ontwijkRechts() {
 
 
 // =============================================================
+// readBatteryVoltage / voltageToPct / updateBatteryLEDs
+// Leest de spanning via een externe spanningsdeler (factor 4.87),
+// berekent het percentage en stuurt de drie status-LEDs aan.
+// =============================================================
+// Batterij meten — werkt ALLEEN vóór WiFi start (GPIO 12 = ADC2, conflicteert met WiFi)
+// Wordt éénmalig aangeroepen in setup() vóór connectWiFi().
+// Daarna blijft batteryV/batteryPct op de gemeten waarde staan.
+float readBatteryVoltage() {
+  const float divider = 3.34;  // gecalibreerd op gemeten vs. werkelijke spanning (7.3V / 6.7V)
+  const float adcRef  = 3.3;
+  const float adcMax  = 4095.0;
+  analogSetPinAttenuation(BAT_PIN, ADC_11db);
+  long sum = 0;
+  for (int i = 0; i < 16; i++) {
+    sum += analogRead(BAT_PIN);
+    delay(2);
+  }
+  float v = ((sum / 16.0f) / adcMax) * adcRef * divider;
+  Serial.printf("[BAT] raw gem=%ld  →  %.2f V\n", sum / 16, v);
+  return v;
+}
+
+int voltageToPct(float v) {
+  const float full  = 8.4;
+  const float empty = 6.4;
+  int pct = (int)((v - empty) / (full - empty) * 100);
+  return constrain(pct, 0, 100);
+}
+
+void updateBatteryLEDs(int pct) {
+  digitalWrite(LED_GREEN,  pct > 30              ? HIGH : LOW);
+  digitalWrite(LED_YELLOW, pct <= 30 && pct > 10 ? HIGH : LOW);
+  digitalWrite(LED_RED,    pct <= 10             ? HIGH : LOW);
+}
+
+
+// =============================================================
+// mqttCallback
+// Verwerkt inkomende MQTT-commando's voor start en stop.
+// =============================================================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String t = String(topic);
+  Serial.println("MQTT ontvangen [" + t + "]");
+  if (t == TOPIC_CMD_STOP || t == TOPIC_BROADCAST) {
+    // Noodstop: geen auto-herstart, wacht op expliciet START-commando
+    running         = false;
+    stopTimerActive = false;
+    stopMotors();
+    statusTekst = "NOODSTOP";
+    Serial.println("[NOODSTOP] Wagon gestopt via MQTT — wacht op START");
+  } else if (t == TOPIC_CMD_START) {
+    running         = true;
+    stopTimerActive = false;
+    statusTekst     = "START";
+    Serial.println("[START] Wagon gestart via MQTT");
+  }
+}
+
+
+// =============================================================
 // setup
 // Eenmalige initialisatie bij opstarten:
 //   - pinmodi instellen
@@ -570,6 +679,12 @@ void setup() {
   pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
   pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
   pinMode(TRIG_PIN, OUTPUT); pinMode(ECHO_PIN, INPUT);
+  pinMode(BTN_START, INPUT_PULLUP);
+  pinMode(BTN_STOP,  INPUT_PULLUP);
+  pinMode(LED_GREEN,  OUTPUT);
+  pinMode(LED_YELLOW, OUTPUT);
+  pinMode(LED_RED,    OUTPUT);
+  analogSetPinAttenuation(BAT_PIN, ADC_11db);
 
   // Servo EERST initialiseren: allocateTimer(0) reserveert timer 0 voor de servo
   // zodat ledcAttachChannel voor de motoren andere timers/kanalen krijgt
@@ -591,10 +706,17 @@ void setup() {
     bufR[i] = digitalRead(IR_R);
   }
 
+  // Batterij meten VÓÓR WiFi — GPIO 12 (ADC2) werkt enkel zonder WiFi via analogRead
+  batteryV   = readBatteryVoltage();
+  batteryPct = voltageToPct(batteryV);
+  updateBatteryLEDs(batteryPct);
+  Serial.printf("[BAT init] %.2f V  %d %%\n", batteryV, batteryPct);
+
   connectWiFi();
   mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
 
-  Serial.println("gereed - lijnvolgen + obstakelontwijking + MQTT");
+  Serial.println("gereed - lijnvolgen + obstakelontwijking + MQTT + knoppen + batterij");
 }
 
 
@@ -620,6 +742,54 @@ void loop() {
   if (millis() - lastMqtt > MQTT_INTERVAL) {
     lastMqtt = millis();
     publishTelemetry();
+  }
+
+  // --- Fysieke knoppen (edge-detect via static) ---
+  static bool lastBtnStart = HIGH;
+  static bool lastBtnStop  = HIGH;
+  bool curStart = digitalRead(BTN_START);
+  bool curStop  = digitalRead(BTN_STOP);
+
+  if (curStart == LOW && lastBtnStart == HIGH) {
+    Serial.println("[KNOP] START → wagon rijdt");
+    running         = true;
+    stopTimerActive = false;
+  }
+  if (curStop == LOW && lastBtnStop == HIGH) {
+    Serial.println("[KNOP] NOODSTOP → wacht op START-knop");
+    running         = false;
+    stopTimerActive = false;  // geen auto-herstart
+    stopMotors();
+    statusTekst = "NOODSTOP";
+  }
+  lastBtnStart = curStart;
+  lastBtnStop  = curStop;
+
+  // Automatisch herstart na STOP_DURATION ms
+  if (stopTimerActive && (millis() - stopTime >= STOP_DURATION)) {
+    running         = true;
+    stopTimerActive = false;
+  }
+
+  // --- Batterij ---
+  // GPIO 12 = ADC2: kan niet worden uitgelezen terwijl WiFi actief is.
+  // Waarde is éénmalig gemeten in setup() vóór WiFi-start en blijft ongewijzigd.
+  // LEDs bijwerken op basis van de opgestarte waarde (elke loop, kost niets).
+  updateBatteryLEDs(batteryPct);
+
+  // Noodstop bij kritiek laag batterijniveau (op basis van opstartmeting)
+  if (batteryPct <= 10 && running) {
+    running         = false;
+    stopTimerActive = false;
+    stopMotors();
+    statusTekst = "ALARM_BATTERY";
+  }
+
+  // Als de robot gestopt is, niets rijden
+  if (!running) {
+    stopMotors();
+    delay(10);
+    return;
   }
 
   // --- Obstakeldetectie ---
@@ -681,14 +851,14 @@ void loop() {
   else if (!L && M && !R) {
     // Alleen midden: robot rijdt recht over de lijn.
     // stepMotorsFade zorgt voor geleidelijk optrekken (minder wiel-slip).
-    zoekStart = 0; // lijn gevonden, zoektimer resetten
+    zoekStart = 0; dwarslijnStart = 0;
     stepMotorsFade(baseSpeed, baseSpeed);
     prevState  = STRAIGHT;
     statusTekst = "RECHTDOOR";
   }
   else if (L && !M && !R) {
     // Alleen links: lijn is ver naar links, harde pivot links.
-    zoekStart = 0;
+    zoekStart = 0; dwarslijnStart = 0;
     lastDir = -1;
     currentLeft = 0; currentRight = 0;
     setMotors(pivotSpeed, -pivotSpeed);
@@ -697,7 +867,7 @@ void loop() {
   }
   else if (!L && !M && R) {
     // Alleen rechts: lijn is ver naar rechts, harde pivot rechts.
-    zoekStart = 0;
+    zoekStart = 0; dwarslijnStart = 0;
     lastDir = 1;
     currentLeft = 0; currentRight = 0;
     setMotors(-pivotSpeed, pivotSpeed);
@@ -708,31 +878,43 @@ void loop() {
     // Links + midden: lijn buigt naar links.
     // Vanuit rechtdoor: zacht ingaan (halve snelheid, binnenste wiel stopt).
     // Vanuit een eerdere bocht: agressievere correctie.
-    zoekStart = 0;
+    zoekStart = 0; dwarslijnStart = 0;
     lastDir = -1;
     currentLeft = 0; currentRight = 0;
-    if (prevState == STRAIGHT) setMotors(baseSpeed / 2, 0);
-    else                       setMotors(baseSpeed, -correction / 2);
+    if (prevState == STRAIGHT) setMotors(baseSpeed, -100);
+    else                       setMotors(baseSpeed, -correction * 3/4);
     prevState  = TURN_L;
     statusTekst = "BOCHT_L";
   }
   else if (!L && M && R) {
     // Midden + rechts: lijn buigt naar rechts. Spiegeling van bovenstaand.
-    zoekStart = 0;
+    zoekStart = 0; dwarslijnStart = 0;
     lastDir = 1;
     currentLeft = 0; currentRight = 0;
-    if (prevState == STRAIGHT) setMotors(0, baseSpeed / 2);
-    else                       setMotors(-correction / 2, baseSpeed);
+    if (prevState == STRAIGHT) setMotors(-100, baseSpeed);
+    else                       setMotors(-correction * 3/4, baseSpeed);
     prevState  = TURN_R;
     statusTekst = "BOCHT_R";
   }
   else {
-    // Alle drie sensoren actief tegelijk = dwarslijn of kruispunt.
-    // Robot stopt volledig. Aanpassen als je kruispunten anders wil behandelen.
+    // Alle drie sensoren actief: bocht of kruispunt.
+    // Kruispunt alleen bevestigen als de toestand langer dan DWARSLIJN_MS aanhoudt.
     zoekStart = 0;
-    stopMotors();
-    prevState  = NONE;
-    statusTekst = "DWARSLIJN";
+    if (dwarslijnStart == 0) dwarslijnStart = millis();
+
+    if (millis() - dwarslijnStart >= DWARSLIJN_MS) {
+      stopMotors();
+      running     = false;
+      prevState   = NONE;
+      statusTekst = "DWARSLIJN";
+      Serial.println("KRUISPUNT gedetecteerd - gestopt");
+    } else {
+      // Nog te kort actief: waarschijnlijk een bocht, rijd door
+      if (lastDir == -1) setMotors(baseSpeed, -100);
+      else               setMotors(-100, baseSpeed);
+      prevState   = NONE;
+      statusTekst = "BOCHT_BREED";
+    }
   }
 
   delay(10); // 20 ms per loop = ~50 Hz lijnvolg-frequentie
