@@ -88,18 +88,9 @@ bool   sL = false, sM = false, sR = false; // gefilterde IR-sensorwaarden
 //   Verlagen als de robot de lijn overshooit bij zoeken.
 // =============================================================
 #define Q 4
-int baseSpeed  = 200;
-int correction = 230;  // verhoogd: scherpere correctie in bochten
-int pivotSpeed = 255;  // max vermogen voor pivot-bochten
-
-// =============================================================
-// MOTOR TRIM (onbalans correctie)
-// Als de robot bij RECHTDOOR naar links trekt: verhoog TRIM_R of verlaag TRIM_L
-// Als de robot bij RECHTDOOR naar rechts trekt: verhoog TRIM_L of verlaag TRIM_R
-// Bereik: -50 tot +50  (begin met stapjes van 5)
-// =============================================================
-int TRIM_L =  0;   // extra PWM op linkermotor
-int TRIM_R =  0;   // extra PWM op rechtermotor
+int baseSpeed  = 190;
+int correction = 240;  // verhoogd: scherpere correctie in bochten
+int pivotSpeed = 210;  // max vermogen voor pivot-bochten
 
 // =============================================================
 // OBSTAKEL-PARAMETERS
@@ -132,10 +123,11 @@ int TRIM_R =  0;   // extra PWM op rechtermotor
 #define MAX_AFSTAND         100   // cm - meetwaarden boven dit worden genegeerd (-1)
 #define RIJD_SNELHEID       195   // PWM rijsnelheid tijdens ontwijking
 #define DRAAI_SNELHEID      200   // PWM draaisnelheid
-#define DRAAI_90_MS         600   // ms voor ~90° draai
-#define SIDESTEP_MS         550   // ms rechtdoor na eerste draai
-#define EXTRA_MS            300   // ms extra vooruit na voorbijrijden
-#define PAS_TIMEOUT_MS     4000   // ms maximale voorbijrij-tijd
+#define DRAAI_90_MS         650   // ms voor ~90° draai
+#define DRAAI_135_MS        200   // ms voor ~135° draai (= DRAAI_90_MS × 1.5)
+#define SIDESTEP_MS         1000   // ms rechtdoor na eerste draai
+#define EXTRA_MS            500   // ms extra vooruit na voorbijrijden
+#define PAS_TIMEOUT_MS     1000   // ms maximale voorbijrij-tijd
 #define ULTRA_INTERVAL      100   // ms tussen ultrasone metingen
 #define BOCHT_BINNEN        100   // PWM binnenwiel terugbocht
 #define BOCHT_BUITEN        180   // PWM buitenwiel terugbocht
@@ -225,15 +217,15 @@ void stopMotors() {
 // =============================================================
 void setMotors(int leftSpeed, int rightSpeed) {
   // Richting linkermotor
-  if (leftSpeed >= 0) { digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); }
-  else { digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); leftSpeed = -leftSpeed; }
+  if (leftSpeed >= 0) { digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); }
+  else { digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); leftSpeed = -leftSpeed; }
 
   // Richting rechtermotor
-  if (rightSpeed >= 0) { digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); }
-  else { digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); rightSpeed = -rightSpeed; }
+  if (rightSpeed >= 0) { digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); }
+  else { digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); rightSpeed = -rightSpeed; }
 
-  ledcWrite(ENA, constrain(leftSpeed  + TRIM_L, 0, 255));
-  ledcWrite(ENB, constrain(rightSpeed + TRIM_R, 0, 255));
+  ledcWrite(ENA, constrain(leftSpeed,  0, 255));
+  ledcWrite(ENB, constrain(rightSpeed, 0, 255));
   lastLeft  = leftSpeed;
   lastRight = rightSpeed;
 }
@@ -250,8 +242,8 @@ void setMotors(int leftSpeed, int rightSpeed) {
 // =============================================================
 void stepMotorsFade(int targetLeft, int targetRight, int step = 8) {
   // Altijd vooruit bij fade (wordt alleen voor rechtdoor gebruikt)
-  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
-  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
 
   // Stap richting doel
   if (currentLeft  < targetLeft)  currentLeft  = min(currentLeft  + step, targetLeft);
@@ -259,8 +251,8 @@ void stepMotorsFade(int targetLeft, int targetRight, int step = 8) {
   if (currentRight < targetRight) currentRight = min(currentRight + step, targetRight);
   if (currentRight > targetRight) currentRight = max(currentRight - step, targetRight);
 
-  ledcWrite(ENA, constrain(currentLeft  + TRIM_L, 0, 255));
-  ledcWrite(ENB, constrain(currentRight + TRIM_R, 0, 255));
+  ledcWrite(ENA, constrain(currentLeft,  0, 255));
+  ledcWrite(ENB, constrain(currentRight, 0, 255));
   lastLeft  = currentLeft;
   lastRight = currentRight;
 }
@@ -381,8 +373,8 @@ void publishOntwijkTelemetry(int stap, unsigned long duurMs,
 // tijdgebonden vooruitrit met automatische stop.
 // =============================================================
 void vooruit(int s) {
-  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
-  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
   ledcWrite(ENA, s);
   ledcWrite(ENB, s);
 }
@@ -397,8 +389,8 @@ void vooruit(int s) {
 // Na de draai: motors stop + 200 ms pauze om trilling te laten dalen.
 // =============================================================
 void draaiRechts(int t) {
-  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); // linker achteruit
-  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);  // rechter vooruit
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);  // linker achteruit
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); // rechter vooruit
   ledcWrite(ENA, DRAAI_SNELHEID);
   ledcWrite(ENB, DRAAI_SNELHEID);
   delay(t);
@@ -413,8 +405,8 @@ void draaiRechts(int t) {
 // Zie draaiRechts() voor aanpassingstips.
 // =============================================================
 void draaiLinks(int t) {
-  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);  // linker vooruit
-  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); // rechter achteruit
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); // linker vooruit
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);  // rechter achteruit
   ledcWrite(ENA, DRAAI_SNELHEID);
   ledcWrite(ENB, DRAAI_SNELHEID);
   delay(t);
@@ -565,28 +557,40 @@ void ontwijkRechts() {
   // -------------------------------------------------------
   servoNaar(SERVO_VOORUIT);
 
+  // -------------------------------------------------------
+  // STAP 4a: draai 135° links → wagon benadert de lijn met een hoek
+  //   135° i.p.v. 90° zodat de wagon schuin naar de lijn rijdt
+  //   en de lijn geleidelijk raakt i.p.v. er recht op te botsen
+  // -------------------------------------------------------
   statusTekst = "TERUGDRAAIEN"; publishTelemetry();
-  Serial.println("Stap 4a: draai 90° links richting lijn");
-  draaiLinks(DRAAI_90_MS);
+  Serial.println("Stap 4a: draai 135° links richting lijn");
+  draaiLinks(DRAAI_135_MS);
 
+  // -------------------------------------------------------
+  // STAP 4b: rijd vooruit tot een IR-sensor de lijn detecteert
+  //   Rijdt niet een vaste tijd maar stopt zodra de lijn gevonden is.
+  //   Timeout van LIJN_ZOEK_MS als veiligheidsgrens.
+  // -------------------------------------------------------
   statusTekst = "TERUG_VOORUIT"; publishTelemetry();
-  Serial.printf("Stap 4b: rijd %d ms vooruit naar lijn\n", SIDESTEP_MS);
-  vooruitTijd(SIDESTEP_MS);
+  Serial.println("Stap 4b: rijd naar lijn tot sensor detecteert");
+  vooruit(RIJD_SNELHEID);
+  unsigned long zoekLijn = millis();
+  bool lijnGevonden = false;
+  while (millis() - zoekLijn < LIJN_ZOEK_MS) {
+    sL = digitalRead(IR_L);
+    sM = digitalRead(IR_M);
+    sR = digitalRead(IR_R);
+    if (sL || sM || sR) { lijnGevonden = true; break; }
+    delay(10);
+  }
+  stopMotors();
 
   // -------------------------------------------------------
   // STAP 5: sensorcheck en telemetrie
-  //   Lees de IR-sensoren uit na aankomst en rapporteer
-  //   welke sensor de lijn ziet. Lijnvolgen wordt sowieso
-  //   hervat door de hoofdlus — de sensoren sturen verder.
   // -------------------------------------------------------
-  lastDir = -1; // zoekrichting instellen als de lijn nog niet meteen gevonden is
-  sL = digitalRead(IR_L);
-  sM = digitalRead(IR_M);
-  sR = digitalRead(IR_R);
-
-  // Bepaal welke sensor(en) de lijn detecteren voor telemetrie
+  lastDir = -1;
   const char* lijnSensor = "geen";
-  if (sL || sM || sR) {
+  if (lijnGevonden) {
     if      (sL && sM && sR) lijnSensor = "L+M+R";
     else if (sL && sM)       lijnSensor = "L+M";
     else if (sM && sR)       lijnSensor = "M+R";
@@ -595,7 +599,6 @@ void ontwijkRechts() {
     else                     lijnSensor = "R";
   }
 
-  bool lijnGevonden = (strcmp(lijnSensor, "geen") != 0);
   statusTekst = lijnGevonden ? "LIJN_HERVAT" : "LIJN_NIET_GEVONDEN";
   publishTelemetry();
   Serial.printf("Stap 5: %s | sensor=[%s] | totale duur: %lu ms\n",
